@@ -1,0 +1,4 @@
+websockets
+clickhouse-connect
+pandas
+httpx
