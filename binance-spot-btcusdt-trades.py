@@ -19,8 +19,15 @@ CLICKHOUSE_DATABASE = "market_data"
 SYMBOL = "btcusdt"
 WS_URL = f"wss://stream.binance.com:9443/stream?streams={SYMBOL}@trade"
 
-BATCH_SIZE = 100
+BATCH_SIZE = 200
+FLUSH_INTERVAL = 1.0
+QUEUE_MAXSIZE = 10000
+
 TABLE_NAME = "spot_trades_btcusdt_test"
+
+# 测试阶段可以 True：每次运行都删表重建
+# 正式采集时一定改成 False，否则每次运行都会删掉历史数据
+DROP_TABLE_ON_START = True
 
 # 如果 historicalTrades 返回 401 / 403，可能需要填 Binance API key
 # 只读 market data，不需要 secret
@@ -39,6 +46,7 @@ COLUMNS = [
     "is_buyer_maker",
     "aggressor_side",
     "run_id",
+    "data_source",
 ]
 
 
@@ -53,6 +61,9 @@ def get_clickhouse_client():
 
 
 def create_trades_table(client):
+    if DROP_TABLE_ON_START:
+        client.command(f"DROP TABLE IF EXISTS {TABLE_NAME}")
+
     client.command(f"""
     CREATE TABLE IF NOT EXISTS {TABLE_NAME}
     (
@@ -72,34 +83,93 @@ def create_trades_table(client):
         is_buyer_maker Bool,
         aggressor_side String,
 
-        run_id String
+        run_id String,
+        data_source String
     )
     ENGINE = MergeTree
     PARTITION BY toYYYYMMDD(trade_time)
     ORDER BY (exchange, market_type, symbol, trade_time, trade_id)
     """)
+
     print(f"Table {TABLE_NAME} is ready.")
-
-
-def upload_trades_df(client, df: pd.DataFrame):
-    client.insert_df(TABLE_NAME, df)
-    print(f"Inserted {len(df)} rows into ClickHouse.")
 
 
 def ms_to_utc(ms: int) -> datetime:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
 
 
-def flush_buffer(client, buffer):
-    """
-    buffer 满了、断线、取消程序时，把已经收到但还没 insert 的数据写入 ClickHouse。
-    """
-    if not buffer:
+async def upload_trades_df(client, df: pd.DataFrame):
+    if df.empty:
         return
 
-    df = pd.DataFrame(buffer, columns=COLUMNS)
-    upload_trades_df(client, df)
-    buffer.clear()
+    await asyncio.to_thread(
+        client.insert_df,
+        TABLE_NAME,
+        df,
+    )
+
+    print(f"Inserted {len(df)} rows into ClickHouse.")
+
+
+async def flush_batch(client, batch):
+    if not batch:
+        return
+
+    df = pd.DataFrame(batch, columns=COLUMNS)
+    await upload_trades_df(client, df)
+    batch.clear()
+
+
+async def write_to_clickhouse(client, queue: asyncio.Queue):
+    """
+    Consumer / writer:
+    专门从 queue 里拿 row，攒成 batch，然后写 ClickHouse。
+    """
+    batch = []
+
+    try:
+        while True:
+            try:
+                row = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=FLUSH_INTERVAL,
+                )
+
+            except asyncio.TimeoutError:
+                # 1 秒内没有新 row，但 batch 里有旧数据，也先写掉
+                if batch:
+                    try:
+                        await flush_batch(client, batch)
+                    except Exception as e:
+                        print(f"ClickHouse flush error: {e}")
+                        await asyncio.sleep(3)
+                continue
+
+            # None 是停止信号
+            if row is None:
+                break
+
+            batch.append(row)
+
+            if len(batch) >= BATCH_SIZE:
+                try:
+                    await flush_batch(client, batch)
+                except Exception as e:
+                    print(f"ClickHouse flush error: {e}")
+                    await asyncio.sleep(3)
+
+    except asyncio.CancelledError:
+        print("Writer cancelled. Flushing remaining batch...")
+        raise
+
+    finally:
+        if batch:
+            try:
+                await flush_batch(client, batch)
+            except Exception as e:
+                print(f"Final flush error: {e}")
+
+        print("ClickHouse writer stopped.")
 
 
 def check_data_gap(currentid, lastid):
@@ -113,12 +183,13 @@ def check_data_gap(currentid, lastid):
     return lastid is not None and currentid > lastid + 1
 
 
-async def fill_data_gap(symbol, fromid, toid, run_id, ch_client):
+async def fill_data_gap(symbol, fromid, toid, run_id, queue: asyncio.Queue):
     """
     用 Binance REST historicalTrades 补 WebSocket 断线期间缺失的 trade。
 
-    fromid: 缺失区间第一条 trade_id
-    toid:   缺失区间最后一条 trade_id
+    注意：
+    这里不直接写 ClickHouse。
+    REST 补回来的 row 也放入 queue，由 writer 统一写库。
     """
     if fromid > toid:
         return
@@ -155,7 +226,7 @@ async def fill_data_gap(symbol, fromid, toid, run_id, ch_client):
                 print(f"No trades returned when backfilling fromId={next_id}")
                 break
 
-            rows = []
+            last_used_id = None
 
             for trade in trades:
                 trade_id = int(trade["id"])
@@ -173,7 +244,7 @@ async def fill_data_gap(symbol, fromid, toid, run_id, ch_client):
                     "trade_id": trade_id,
 
                     # REST historicalTrades 没有 WebSocket 里的 event time E
-                    # 所以这里暂时用 trade_time 填 event_ts，保证类型是 DateTime64
+                    # 所以这里暂时用 trade_time 填 event_ts
                     "event_ts": trade_time,
                     "trade_time": trade_time,
                     "recv_ts": datetime.now(timezone.utc),
@@ -185,20 +256,23 @@ async def fill_data_gap(symbol, fromid, toid, run_id, ch_client):
                     "aggressor_side": "sell" if trade["isBuyerMaker"] else "buy",
 
                     "run_id": run_id,
+                    "data_source": "rest_backfill",
                 }
 
-                rows.append(row)
+                await queue.put(row)
 
-            if rows:
-                df = pd.DataFrame(rows, columns=COLUMNS)
-                upload_trades_df(ch_client, df)
-                total_backfilled += len(rows)
+                total_backfilled += 1
+                last_used_id = trade_id
 
             last_returned_id = int(trades[-1]["id"])
-            next_id = last_returned_id + 1
 
             if last_returned_id >= toid:
                 break
+
+            if last_used_id is None:
+                next_id = last_returned_id + 1
+            else:
+                next_id = last_used_id + 1
 
             await asyncio.sleep(0.1)
 
@@ -208,11 +282,17 @@ async def fill_data_gap(symbol, fromid, toid, run_id, ch_client):
     )
 
 
-async def get_binance_spot_trades(ws_url, run_id, client, symbol):
-    buffer = []
+async def get_binance_spot_trades(ws_url, run_id, symbol, queue: asyncio.Queue):
+    """
+    Producer / reader:
+    只负责：
+    1. 收 WebSocket
+    2. 检查 trade_id gap
+    3. 需要时 REST backfill
+    4. 把 row 放入 queue
 
-    # 这里只记录本次程序运行期间的 lastid
-    # WebSocket 断线但程序没退出时，lastid 会保留
+    不直接写 ClickHouse。
+    """
     lastid = None
 
     async for ws in connect(
@@ -232,7 +312,7 @@ async def get_binance_spot_trades(ws_url, run_id, client, symbol):
 
                 currentid = int(data["t"])
 
-                # 1. 先检查 currentid 和 lastid 是否连续
+                # 1. 检查 currentid 和 lastid 是否连续
                 if check_data_gap(currentid, lastid):
                     missing_from = lastid + 1
                     missing_to = currentid - 1
@@ -244,17 +324,16 @@ async def get_binance_spot_trades(ws_url, run_id, client, symbol):
                         f"count={missing_count}"
                     )
 
-                    # 先把当前 buffer 里已有的正常数据写入 ClickHouse
-                    flush_buffer(client, buffer)
-
-                    # 再补缺失的 trade
-                    await fill_data_gap(
-                        symbol=symbol,
-                        fromid=missing_from,
-                        toid=missing_to,
-                        run_id=run_id,
-                        ch_client=client,
-                    )
+                    try:
+                        await fill_data_gap(
+                            symbol=symbol,
+                            fromid=missing_from,
+                            toid=missing_to,
+                            run_id=run_id,
+                            queue=queue,
+                        )
+                    except Exception as e:
+                        print(f"Backfill failed: {e}. Continue with current trade.")
 
                 elif lastid is not None and currentid <= lastid:
                     print(
@@ -263,7 +342,7 @@ async def get_binance_spot_trades(ws_url, run_id, client, symbol):
                     )
                     continue
 
-                # 2. gap 处理完，再构造当前 WebSocket trade
+                # 2. 构造当前 WebSocket trade
                 row = {
                     "exchange": "binance",
                     "market_type": "spot",
@@ -282,37 +361,32 @@ async def get_binance_spot_trades(ws_url, run_id, client, symbol):
                     "aggressor_side": "sell" if data["m"] else "buy",
 
                     "run_id": run_id,
+                    "data_source": "websocket",
                 }
 
-                buffer.append(row)
+                await queue.put(row)
 
-                # 3. 当前 trade 成功进入 buffer 后，更新 lastid
+                # 3. 当前 trade 成功进入 queue 后，更新 lastid
                 lastid = currentid
-
-                # 4. buffer 满 100 条就写入 ClickHouse
-                if len(buffer) >= BATCH_SIZE:
-                    flush_buffer(client, buffer)
 
         except ConnectionClosed as e:
             print(f"Connection closed: {e}. Reconnecting...")
-            flush_buffer(client, buffer)
             continue
 
         except asyncio.CancelledError:
-            print("Cancelled. Flushing buffer and exiting...")
-            flush_buffer(client, buffer)
+            print("Reader cancelled.")
             raise
 
         except Exception as e:
             print(f"Unexpected error: {e}. Reconnecting after 3 seconds...")
-            flush_buffer(client, buffer)
             await asyncio.sleep(3)
             continue
 
 
 async def main():
-    client = get_clickhouse_client()
+    queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
 
+    client = get_clickhouse_client()
     create_trades_table(client)
 
     run_id = str(uuid4())
@@ -320,12 +394,31 @@ async def main():
     print(f"run_id = {run_id}")
     print(f"Connecting to Binance {SYMBOL.upper()} spot trade WebSocket...")
 
-    await get_binance_spot_trades(
-        ws_url=WS_URL,
-        run_id=run_id,
-        client=client,
-        symbol=SYMBOL,
+    writer_task = asyncio.create_task(
+        write_to_clickhouse(client, queue)
     )
+
+    try:
+        await get_binance_spot_trades(
+            ws_url=WS_URL,
+            run_id=run_id,
+            symbol=SYMBOL,
+            queue=queue,
+        )
+
+    except asyncio.CancelledError:
+        print("Main cancelled.")
+        raise
+
+    finally:
+        print("Stopping writer...")
+
+        # 给 writer 一个停止信号，让它 flush 剩余 batch 后退出
+        await queue.put(None)
+
+        await writer_task
+
+        print("Program exited cleanly.")
 
 
 if __name__ == "__main__":
